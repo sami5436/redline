@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { chatJson, type JsonCallResult } from "./nebius";
+import { chatJson, models, providerName, type JsonCallResult } from "./llm";
 import { tavilySearch } from "./tavily";
 import type { Claim, DiligenceEvent, PlannedQuery, Report, Source, StageId, Tier } from "./types";
 
@@ -16,7 +16,8 @@ const DIMENSIONS = [
 ] as const;
 
 const MAX_SOURCES = 24;
-const EXTRACT_CONCURRENCY = 6;
+const EXTRACT_CONCURRENCY = 4;
+const MAX_JUDGE_CLAIMS = 70;
 
 // ---------- schemas (lenient: models drift, the UI must not crash) ----------
 
@@ -61,6 +62,8 @@ const JudgeSchema = z.object({
     )
     .catch([]),
   strengths: z.array(z.object({ point: z.string(), evidence: z.array(z.string()).catch([]) })).catch([]),
+  contradictions: z.array(z.object({ summary: z.string(), evidence: z.array(z.string()).catch([]) })).catch([]),
+  mitigations: z.array(z.object({ action: z.string(), addresses: z.string().catch("") })).catch([]),
   open_questions: z.array(z.string()).catch([]),
 });
 
@@ -143,7 +146,7 @@ Rules:
 - If the source is about a different entity with a similar name, set "about_subject": false and return no claims.
 - Each claim is one self-contained sentence with concrete specifics (amounts, dates, agencies, counterparties).
 - signal: "red" = serious risk (fraud, enforcement, lawsuit, breach, insolvency), "amber" = caution (layoffs, complaints, leadership churn, losses), "green" = positive evidence (audits passed, profitability, certifications), "neutral" = context.
-- At most 5 claims, most diligence-relevant first.
+- At most 4 claims, most diligence-relevant first. Skip boilerplate and generic background.
 Respond with JSON: {"about_subject": boolean, "claims": [{"text": string, "category": string, "signal": "red|amber|green|neutral", "date": string|null}]}`;
 
   let counter = 0;
@@ -154,7 +157,11 @@ Respond with JSON: {"about_subject": boolean, "claims": [{"text": string, "categ
         emit,
         "extract",
         "nano",
-        await chatJson("nano", system, user, (raw) => ExtractSchema.parse(raw), { maxTokens: 1024, temperature: 0 }),
+        await chatJson("nano", system, user, (raw) => ExtractSchema.parse(raw), {
+          maxTokens: 1024,
+          temperature: 0,
+          timeoutMs: 40_000,
+        }),
       );
       const claims: Claim[] = data.about_subject
         ? data.claims.map((c) => ({
@@ -168,7 +175,8 @@ Respond with JSON: {"about_subject": boolean, "claims": [{"text": string, "categ
         : [];
       emit({ type: "claims", sourceId: src.id, claims });
       return claims;
-    } catch {
+    } catch (err) {
+      console.error(`extract ${src.id} failed:`, err instanceof Error ? err.message : err);
       emit({ type: "claims", sourceId: src.id, claims: [] });
       return [];
     }
@@ -176,25 +184,41 @@ Respond with JSON: {"about_subject": boolean, "claims": [{"text": string, "categ
   return perSource.flat();
 }
 
-async function judge(subject: string, context: string, entityType: string, claims: Claim[], emit: Emit): Promise<Report> {
+async function judge(
+  subject: string,
+  context: string,
+  entityType: string,
+  claims: Claim[],
+  sources: Source[],
+  emit: Emit,
+): Promise<Report> {
   const system = `You are the head of risk at an investment and procurement firm. You receive a file of claims extracted from web sources about a subject, each with an id like C12.
 Produce a diligence verdict.
 Rules:
-- Every red flag and strength MUST cite claim ids from the file in "evidence". Never cite ids that are not in the file.
+- Every red flag and strength MUST cite claim ids from the file in "evidence": the 2-6 strongest, preferring different sources. Never cite ids that are not in the file.
 - Weigh severity, recency, corroboration across independent sources, and relevance to the stated purpose. Corroborated, recent, high-severity issues dominate.
 - Merge duplicate claims into one flag. Do not inflate minor issues; say so if the record is clean.
+- contradictions: places where sources disagree with each other or with the subject's own statements (e.g. company denies a breach a regulator confirmed; conflicting funding figures). Cite the conflicting claim ids. Empty if none.
+- mitigations: concrete, purpose-specific protections that would make proceeding safer, each tied to a red flag title (e.g. "Require SOC 2 Type II report before data sharing", "Hold customer funds in FBO accounts at a second bank"). Practical contract or process terms, not generic advice.
 - open_questions: what a careful analyst would still need to verify (things the sources could not settle).
 - risk_score: 0 = no concerns, 30 = normal business noise, 60 = proceed only with mitigations, 85+ = walk away.
 - verdict: one short line, e.g. "Proceed with standard terms" or "Do not proceed without escrow and audit rights".
-Respond with JSON: {"risk_score": number, "verdict": string, "summary": string (3-4 sentences), "red_flags": [{"title": string, "severity": "high|medium|low", "explanation": string, "evidence": [claim ids]}], "strengths": [{"point": string, "evidence": [claim ids]}], "open_questions": [string]}`;
-  const file = claims.map((c) => `${c.id} [${c.signal}] [${c.category}]${c.date ? ` (${c.date})` : ""} ${c.text} — ${c.sourceId}`).join("\n");
-  const user = `Subject: ${subject} (${entityType})\nPurpose: ${context || "general due diligence"}\n\nClaims file (${claims.length} claims):\n${file || "(no claims found)"}`;
+Respond with JSON: {"risk_score": number, "verdict": string, "summary": string (3-4 sentences), "red_flags": [{"title": string, "severity": "high|medium|low", "explanation": string, "evidence": [claim ids]}], "strengths": [{"point": string, "evidence": [claim ids]}], "contradictions": [{"summary": string, "evidence": [claim ids]}], "mitigations": [{"action": string, "addresses": string}], "open_questions": [string]}`;
+  // Keep the judge prompt bounded: signal claims first, then neutral context.
+  const priority = { red: 0, amber: 1, green: 2, neutral: 3 };
+  const selected = [...claims].sort((x, y) => priority[x.signal] - priority[y.signal]).slice(0, MAX_JUDGE_CLAIMS);
+  const file = selected.map((c) => `${c.id} [${c.signal}] [${c.category}]${c.date ? ` (${c.date})` : ""} ${c.text} — ${c.sourceId}`).join("\n");
+  const user = `Subject: ${subject} (${entityType})\nPurpose: ${context || "general due diligence"}\n\nClaims file (${selected.length} claims):\n${file || "(no claims found)"}`;
 
   const data = record(
     emit,
     "judge",
     "ultra",
-    await chatJson("ultra", system, user, (raw) => JudgeSchema.parse(raw), { maxTokens: 4096, temperature: 0.1 }),
+    await chatJson("ultra", system, user, (raw) => JudgeSchema.parse(raw), {
+      maxTokens: 5000,
+      temperature: 0.2,
+      timeoutMs: 150_000,
+    }),
   );
 
   // Verifier: strip any citation the judge invented; drop flags left with no evidence.
@@ -205,9 +229,19 @@ Respond with JSON: {"risk_score": number, "verdict": string, "summary": string (
     dropped += ids.length - ok.length;
     return [...new Set(ok)];
   };
+  // Corroboration = how many independent domains stand behind a flag.
+  const domainOf = new Map(sources.map((s) => [s.id, hostname(s.url)]));
+  const claimSource = new Map(claims.map((c) => [c.id, c.sourceId]));
+  const domains = (ids: string[]) => new Set(ids.map((id) => domainOf.get(claimSource.get(id) ?? ""))).size;
+  const sev = { high: 0, medium: 1, low: 2 };
   const redFlags = data.red_flags
     .map((f) => ({ ...f, evidence: keep(f.evidence) }))
-    .filter((f) => f.evidence.length > 0);
+    .filter((f) => f.evidence.length > 0)
+    .map((f) => ({ ...f, corroboration: domains(f.evidence) }))
+    .sort((a, b) => sev[a.severity] - sev[b.severity] || b.corroboration - a.corroboration);
+  const contradictions = data.contradictions
+    .map((c) => ({ ...c, evidence: keep(c.evidence) }))
+    .filter((c) => c.evidence.length >= 2);
   const strengths = data.strengths
     .map((s) => ({ ...s, evidence: keep(s.evidence) }))
     .filter((s) => s.evidence.length > 0);
@@ -220,6 +254,8 @@ Respond with JSON: {"risk_score": number, "verdict": string, "summary": string (
     summary: data.summary,
     redFlags,
     strengths,
+    contradictions,
+    mitigations: data.mitigations.filter((m) => m.action.trim()),
     openQuestions: data.open_questions,
     droppedCitations: dropped,
   };
@@ -227,7 +263,16 @@ Respond with JSON: {"risk_score": number, "verdict": string, "summary": string (
 
 // ---------- orchestration ----------
 
+function hostname(url: string) {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
 export async function runDiligence(subject: string, context: string, emit: Emit) {
+  emit({ type: "provider", name: providerName(), models: await models() });
   emit({ type: "stage", stage: "plan", status: "running" });
   const p = await plan(subject, context, emit);
   emit({ type: "plan", entityType: p.entity_type, canonicalName: p.canonical_name, queries: p.queries });
@@ -244,7 +289,7 @@ export async function runDiligence(subject: string, context: string, emit: Emit)
   emit({ type: "stage", stage: "extract", status: "done", detail: `${claims.length} claims` });
 
   emit({ type: "stage", stage: "judge", status: "running" });
-  const report = await judge(p.canonical_name, context, p.entity_type, claims, emit);
+  const report = await judge(p.canonical_name, context, p.entity_type, claims, sources, emit);
   emit({ type: "report", report });
   emit({ type: "stage", stage: "judge", status: "done", detail: `risk ${report.riskScore}/100` });
 }

@@ -33,6 +33,17 @@ export interface RedFlag {
   severity: "high" | "medium" | "low";
   explanation: string;
   evidence: string[]; // claim ids, verified to exist
+  corroboration: number; // distinct domains behind the evidence
+}
+
+export interface Contradiction {
+  summary: string;
+  evidence: string[];
+}
+
+export interface Mitigation {
+  action: string;
+  addresses: string; // red flag title
 }
 
 export interface Report {
@@ -43,6 +54,8 @@ export interface Report {
   summary: string;
   redFlags: RedFlag[];
   strengths: { point: string; evidence: string[] }[];
+  contradictions: Contradiction[];
+  mitigations: Mitigation[];
   openQuestions: string[];
   droppedCitations: number; // citations the judge model invented, removed by verifier
 }
@@ -57,6 +70,7 @@ export interface ModelCall {
 }
 
 export type DiligenceEvent =
+  | { type: "provider"; name: string; models: Record<Tier, string> }
   | { type: "stage"; stage: StageId; status: "running" | "done"; detail?: string }
   | { type: "plan"; entityType: string; canonicalName: string; queries: PlannedQuery[] }
   | { type: "sources"; sources: Source[] }

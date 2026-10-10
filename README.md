@@ -29,11 +29,23 @@ Generic chatbots don't fix this. They summarize confidently and invent sources. 
         │                       same-name entities ("about_subject": false)
         ▼
  ④ JUDGE     Nemotron Ultra  ─ weighs severity, recency, and corroboration against your
-        │                      stated purpose → risk score, verdict, flags, open questions
+        │                      stated purpose → risk score, verdict, flags, contradictions
+        │                      between sources, purpose-specific deal protections
         ▼
  ⑤ VERIFY    deterministic   ─ strips any claim ID the judge cited that doesn't exist
-                               and drops flags left with no evidence
+                               and drops flags left with no evidence, then counts the
+                               independent domains behind each flag
 ```
+
+### What you get
+
+- **Risk verdict** (0–100) with a one-line recommendation for your stated purpose
+- **Red flags**, each with hover-to-preview citations and an *independent-domain corroboration* count
+- **Contradictions**, where sources disagree with each other or with the company's own statements
+- **Deal protections**: concrete contract or process terms that address each flag
+- **Signal history**, a timeline of dated risk, caution, and positive evidence
+- **Evidence ledger** with every extracted claim, linked to its source
+- **Exportable memo** in Markdown with footnoted evidence
 
 Everything streams to the browser as NDJSON, so you watch the plan, sources, and claims arrive live.
 
@@ -47,17 +59,28 @@ Everything streams to the browser as NDJSON, so you watch the plan, sources, and
 
 A typical run is about 26 model calls, and around 90% of them are Nano. The UI shows the calls, tokens, and latency for each tier.
 
-Model IDs are **auto-resolved** from Token Factory's `/v1/models` list (newest Nemotron 3 Nano, Super, and Ultra) or pinned with env vars.
+Model IDs are **auto-resolved** from the provider's `/v1/models` list (newest Nemotron 3 Nano, Super, and Ultra) or pinned with `MODEL_NANO`, `MODEL_SUPER`, and `MODEL_ULTRA`.
+
+### Resilient inference
+
+Every model call has a deadline and a failover plan. On a 429 or 5xx it backs off and retries, then moves to a sibling model in the same tier (e.g. Nemotron 3 Nano → Nemotron 3.5 Lightning), then borrows the next tier. The UI shows which model actually answered each call.
+
+### Providers
+
+| Env var | Endpoint |
+|---|---|
+| `NEBIUS_API_KEY` | Nebius Token Factory (primary; used whenever set) |
+| `NVIDIA_API_KEY` | NVIDIA API Catalog, `integrate.api.nvidia.com` (development fallback) |
 
 ## Run it locally
 
-Requirements: Node 22+, a [Nebius Token Factory](https://tokenfactory.nebius.com) API key, and a [Tavily](https://app.tavily.com) API key.
+Requirements: Node 22+, a [Nebius Token Factory](https://tokenfactory.nebius.com) API key (or an [NVIDIA API Catalog](https://build.nvidia.com) key), and a [Tavily](https://app.tavily.com) API key.
 
 ```bash
 git clone https://github.com/sami5436/redline.git
 cd redline
 npm install
-cp .env.example .env.local     # add NEBIUS_API_KEY and TAVILY_API_KEY
+cp .env.example .env.local     # add NEBIUS_API_KEY (or NVIDIA_API_KEY) and TAVILY_API_KEY
 npm run models                 # optional: list the Nemotron models your key can access
 npm run dev                    # http://localhost:3000
 ```
@@ -77,7 +100,9 @@ The app is a standard Next.js app with a single streaming route handler (`maxDur
 
 ```
 src/lib/pipeline.ts      the agent: plan → search → extract → judge → verify
-src/lib/nebius.ts        Token Factory client, model auto-resolution, JSON-mode calls
+src/lib/llm.ts           provider selection, model routing and failover, JSON-mode calls
+src/lib/memo.ts          Markdown memo export
+src/components/          pipeline, report, timeline, evidence ledger, citation chips
 src/lib/tavily.ts        Tavily search client
 src/app/api/diligence    streaming NDJSON endpoint
 src/app/page.tsx         UI: live pipeline, report, evidence ledger, markdown export
